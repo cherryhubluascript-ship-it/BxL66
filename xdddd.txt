@@ -1,0 +1,1072 @@
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "BxL Lagger"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent = game.CoreGui
+
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Stats = game:GetService("Stats")
+local UserInputService = game:GetService("UserInputService")
+local Players = game:GetService("Players")
+local LocalPlayer = Players.LocalPlayer
+
+-- ===== LAGGER VARIABLES =====
+local LagEnabled = false
+local SpeedEnabled = false
+local LagIntensity = 5
+local SpeedValue = 16
+local NormalSpeed = 16
+local uuid = "d80e2217-36b8-4bdc-9a46-2281c6f70b28"
+local payload = string.rep("z", 30000)
+local targetRemote = nil
+
+-- ===== INSTANT GRAB (SILENT_) INTEGRATION =====
+local CONFIG = {
+	AUTO_STEAL_NEAREST = false,
+}
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local success, AnimalsData = pcall(require, ReplicatedStorage:WaitForChild("Datas"):WaitForChild("Animals"))
+if not success then
+    warn("Failed to load AnimalsData: " .. tostring(AnimalsData))
+    AnimalsData = {}
+end
+
+local allAnimalsCache = {}
+local PromptMemoryCache = {}
+local InternalStealCache = {}
+local LastTargetUID = nil
+local LastPlayerPosition = nil
+local PlayerVelocity = Vector3.zero
+local AUTO_STEAL_PROX_RADIUS = 20
+local IsStealing = false
+local StealProgress = 0
+local CurrentStealTarget = nil
+local StealStartTime = 0
+
+local CIRCLE_RADIUS = AUTO_STEAL_PROX_RADIUS
+local PART_THICKNESS = 0.3
+local PART_HEIGHT = 0.2
+local PART_COLOR = Color3.fromRGB(0, 128, 255) -- Blue accent
+local PartsCount = 65
+local circleParts = {}
+local circleEnabled = true
+
+local stealConnection = nil
+local velocityConnection = nil
+
+local function getHRP()
+	local char = LocalPlayer.Character
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart") or char:FindFirstChild("UpperTorso")
+end
+
+local function isMyBase(plotName)
+	local plot = workspace.Plots:FindFirstChild(plotName)
+	if not plot then return false end
+	
+	local sign = plot:FindFirstChild("PlotSign")
+	if sign then
+		local yourBase = sign:FindFirstChild("YourBase")
+		if yourBase and yourBase:IsA("BillboardGui") then
+			return yourBase.Enabled == true
+		end
+	end
+	return false
+end
+
+local function scanSinglePlot(plot)
+	if not plot or not plot:IsA("Model") then return end
+	if isMyBase(plot.Name) then return end
+	
+	local podiums = plot:FindFirstChild("AnimalPodiums")
+	if not podiums then return end
+	
+	for _, podium in ipairs(podiums:GetChildren()) do
+		if podium:IsA("Model") and podium:FindFirstChild("Base") then
+			local animalName = "Unknown"
+			local spawn = podium.Base:FindFirstChild("Spawn")
+			if spawn then
+				for _, child in ipairs(spawn:GetChildren()) do
+					if child:IsA("Model") and child.Name ~= "PromptAttachment" then
+						animalName = child.Name
+						local animalInfo = AnimalsData[animalName]
+						if animalInfo and animalInfo.DisplayName then
+							animalName = animalInfo.DisplayName
+						end
+						break
+					end
+				end
+			end
+			
+			table.insert(allAnimalsCache, {
+				name = animalName,
+				plot = plot.Name,
+				slot = podium.Name,
+				worldPosition = podium:GetPivot().Position,
+				uid = plot.Name .. "*" .. podium.Name,
+			})
+		end
+	end
+end
+
+local function initializeScanner()
+	task.wait(2)
+	
+	local plots = workspace:WaitForChild("Plots", 10)
+	if not plots then
+		return
+	end
+	
+	for _, plot in ipairs(plots:GetChildren()) do
+		if plot:IsA("Model") then
+			scanSinglePlot(plot)
+		end
+	end
+	
+	plots.ChildAdded:Connect(function(plot)
+		if plot:IsA("Model") then
+			task.wait(0.5)
+			scanSinglePlot(plot)
+		end
+	end)
+	
+	task.spawn(function()
+		while task.wait(5) do
+			allAnimalsCache = {}
+			for _, plot in ipairs(plots:GetChildren()) do
+				if plot:IsA("Model") then
+					scanSinglePlot(plot)
+				end
+			end
+		end
+	end)
+end
+
+local function findProximityPromptForAnimal(animalData)
+	if not animalData then return nil end
+	
+	local cachedPrompt = PromptMemoryCache[animalData.uid]
+	if cachedPrompt and cachedPrompt.Parent then
+		return cachedPrompt
+	end
+	
+	local plot = workspace.Plots:FindFirstChild(animalData.plot)
+	if not plot then return nil end
+	
+	local podiums = plot:FindFirstChild("AnimalPodiums")
+	if not podiums then return nil end
+	
+	local podium = podiums:FindFirstChild(animalData.slot)
+	if not podium then return nil end
+	
+	local base = podium:FindFirstChild("Base")
+	if not base then return nil end
+	
+	local spawn = base:FindFirstChild("Spawn")
+	if not spawn then return nil end
+	
+	local attach = spawn:FindFirstChild("PromptAttachment")
+	if not attach then return nil end
+	
+	for _, p in ipairs(attach:GetChildren()) do
+		if p:IsA("ProximityPrompt") then
+			PromptMemoryCache[animalData.uid] = p
+			return p
+		end
+	end
+	
+	return nil
+end
+
+local function updatePlayerVelocity()
+	local hrp = getHRP()
+	if not hrp then return end
+	
+	local currentPos = hrp.Position
+	
+	if LastPlayerPosition then
+		PlayerVelocity = (currentPos - LastPlayerPosition) / task.wait()
+	end
+	
+	LastPlayerPosition = currentPos
+end
+
+local function shouldSteal(animalData)
+	if not animalData or not animalData.worldPosition then return false end
+	
+	local hrp = getHRP()
+	if not hrp then return false end
+	
+	local currentDistance = (hrp.Position - animalData.worldPosition).Magnitude
+	
+	return currentDistance <= AUTO_STEAL_PROX_RADIUS
+end
+
+local function buildStealCallbacks(prompt)
+	if InternalStealCache[prompt] then return end
+	
+	local data = {
+		holdCallbacks = {},
+		triggerCallbacks = {},
+		ready = true,
+	}
+	
+	local ok1, conns1 = pcall(getconnections, prompt.PromptButtonHoldBegan)
+	if ok1 and type(conns1) == "table" then
+		for _, conn in ipairs(conns1) do
+			if type(conn.Function) == "function" then
+				table.insert(data.holdCallbacks, conn.Function)
+			end
+		end
+	end
+	
+	local ok2, conns2 = pcall(getconnections, prompt.Triggered)
+	if ok2 and type(conns2) == "table" then
+		for _, conn in ipairs(conns2) do
+			if type(conn.Function) == "function" then
+				table.insert(data.triggerCallbacks, conn.Function)
+			end
+		end
+	end
+	
+	if (#data.holdCallbacks > 0) or (#data.triggerCallbacks > 0) then
+		InternalStealCache[prompt] = data
+	end
+end
+
+local function executeInternalStealAsync(prompt, animalData)
+	local data = InternalStealCache[prompt]
+	if not data or not data.ready then return false end
+	
+	data.ready = false
+	IsStealing = true
+	StealProgress = 0
+	CurrentStealTarget = animalData
+	StealStartTime = tick()
+	
+	task.spawn(function()
+		if #data.holdCallbacks > 0 then
+			for _, fn in ipairs(data.holdCallbacks) do
+				task.spawn(fn)
+			end
+		end
+		
+		local startTime = tick()
+		while tick() - startTime < 1.3 do
+			StealProgress = (tick() - startTime) / 1.3
+			task.wait(0.05)
+		end
+		StealProgress = 1
+		
+		if #data.triggerCallbacks > 0 then
+			for _, fn in ipairs(data.triggerCallbacks) do
+				task.spawn(fn)
+			end
+		end
+		
+		task.wait(0.1)
+		data.ready = true
+		
+		task.wait(0.3)
+		IsStealing = false
+		StealProgress = 0
+		CurrentStealTarget = nil
+	end)
+	
+	return true
+end
+
+local function attemptSteal(prompt, animalData)
+	if not prompt or not prompt.Parent then return false end
+	
+	buildStealCallbacks(prompt)
+	if not InternalStealCache[prompt] then return false end
+	
+	return executeInternalStealAsync(prompt, animalData)
+end
+
+local function getNearestAnimal()
+	local hrp = getHRP()
+	if not hrp then return nil end
+	
+	local nearest = nil
+	local minDist = math.huge
+	
+	for _, animalData in ipairs(allAnimalsCache) do
+		if isMyBase(animalData.plot) then continue end
+		
+		if animalData.worldPosition then
+			local dist = (hrp.Position - animalData.worldPosition).Magnitude
+			if dist < minDist then
+				minDist = dist
+				nearest = animalData
+			end
+		end
+	end
+	
+	return nearest
+end
+
+local function autoStealLoop()
+	if stealConnection then stealConnection:Disconnect() end
+	if velocityConnection then velocityConnection:Disconnect() end
+	
+	velocityConnection = RunService.Heartbeat:Connect(updatePlayerVelocity)
+	
+	stealConnection = RunService.Heartbeat:Connect(function()
+		if not CONFIG.AUTO_STEAL_NEAREST then return end
+		if IsStealing then return end
+		
+		local targetAnimal = getNearestAnimal()
+		if not targetAnimal then return end
+		
+		if not shouldSteal(targetAnimal) then return end
+		
+		if LastTargetUID ~= targetAnimal.uid then
+			LastTargetUID = targetAnimal.uid
+		end
+		
+		local prompt = PromptMemoryCache[targetAnimal.uid]
+		if not prompt or not prompt.Parent then
+			prompt = findProximityPromptForAnimal(targetAnimal)
+		end
+		
+		if prompt then
+			attemptSteal(prompt, targetAnimal)
+		end
+	end)
+end
+
+-- ===== TARGET FINDER LOGIC =====
+local function findTarget()
+	for _, v in pairs(game:GetDescendants()) do
+		if v:IsA("RemoteEvent") and v.Name ~= "friendmain" and v.Name ~= "ping" then
+			targetRemote = v
+			print("Found target remote:", v.Name)
+			break
+		end
+	end
+	if not targetRemote then
+		print("No target remote found!")
+	end
+end
+findTarget()
+
+-- ANIMATED GLOWING EFFECT (enhanced with neon pulse)
+local function animateGradient(gradient)
+	local tweenInfo = TweenInfo.new(
+		2, -- Faster for neon feel
+		Enum.EasingStyle.Sine,
+		Enum.EasingDirection.InOut,
+		-1,
+		true, -- Reverse for pulse effect
+		0
+	)
+	local tween = TweenService:Create(gradient, tweenInfo, {
+		Rotation = 360
+	})
+	tween:Play()
+end
+
+-- ===== MAIN FRAME =====
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "BxLFrame"
+MainFrame.Size = UDim2.new(0, 320, 0, 450) -- Increased height for additional elements
+MainFrame.Position = UDim2.new(0.5, -160, 0.5, -225)
+MainFrame.BackgroundColor3 = Color3.fromRGB(15, 20, 30) -- Dark blue-ish background
+MainFrame.BackgroundTransparency = 0.3
+MainFrame.BorderSizePixel = 0
+MainFrame.Visible = true
+MainFrame.Parent = ScreenGui
+
+local MainFrameCorner = Instance.new("UICorner")
+MainFrameCorner.CornerRadius = UDim.new(0, 20) -- Smoother corners
+MainFrameCorner.Parent = MainFrame
+
+local MainFrameStroke = Instance.new("UIStroke")
+MainFrameStroke.Color = Color3.fromRGB(0, 255, 255) -- Cyan stroke
+MainFrameStroke.Thickness = 2.5
+MainFrameStroke.Transparency = 0
+MainFrameStroke.Parent = MainFrame
+
+local MainFrameGradient = Instance.new("UIGradient")
+MainFrameGradient.Color = ColorSequence.new{
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 255, 255)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 100, 200)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 255, 255))
+}
+MainFrameGradient.Parent = MainFrameStroke -- Neon glow effect
+
+local OuterGlow = Instance.new("UIStroke")
+OuterGlow.Color = Color3.fromRGB(0, 255, 255)
+OuterGlow.Thickness = 3
+OuterGlow.Transparency = 0.5
+OuterGlow.Parent = MainFrame
+
+local MainFrameInnerBorder = Instance.new("Frame")
+MainFrameInnerBorder.Size = UDim2.new(1, -12, 1, -12)
+MainFrameInnerBorder.Position = UDim2.new(0, 6, 0, 6)
+MainFrameInnerBorder.BackgroundTransparency = 1
+MainFrameInnerBorder.Parent = MainFrame
+
+local MainFrameInnerCorner = Instance.new("UICorner")
+MainFrameInnerCorner.CornerRadius = UDim.new(0, 16)
+MainFrameInnerCorner.Parent = MainFrameInnerBorder
+
+local MainFrameInnerStroke = Instance.new("UIStroke")
+MainFrameInnerStroke.Color = Color3.fromRGB(0, 200, 255)
+MainFrameInnerStroke.Thickness = 1.8
+MainFrameInnerStroke.Transparency = 0.3
+MainFrameInnerStroke.Parent = MainFrameInnerBorder
+
+local MainFrameTitle = Instance.new("TextLabel")
+MainFrameTitle.Size = UDim2.new(0, 200, 0, 50)
+MainFrameTitle.Position = UDim2.new(0, 25, 0, 10)
+MainFrameTitle.BackgroundTransparency = 1
+MainFrameTitle.Text = "HYDRA HUB"
+MainFrameTitle.TextColor3 = Color3.fromRGB(0, 255, 255) -- Cyan text
+MainFrameTitle.TextSize = 28
+MainFrameTitle.Font = Enum.Font.SourceSansBold -- Changed font for modern look
+MainFrameTitle.TextXAlignment = Enum.TextXAlignment.Left
+MainFrameTitle.Parent = MainFrame
+
+local MainFrameSubtitle = Instance.new("TextLabel")
+MainFrameSubtitle.Size = UDim2.new(0, 200, 0, 20)
+MainFrameSubtitle.Position = UDim2.new(0, 25, 0, 40)
+MainFrameSubtitle.BackgroundTransparency = 1
+MainFrameSubtitle.Text = "Lagger + Instant Grab"
+MainFrameSubtitle.TextColor3 = Color3.fromRGB(150, 255, 255)
+MainFrameSubtitle.TextSize = 16
+MainFrameSubtitle.Font = Enum.Font.SourceSansItalic
+MainFrameSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+MainFrameSubtitle.Parent = MainFrame
+
+local MainFrameDivider = Instance.new("Frame")
+MainFrameDivider.Size = UDim2.new(1, -40, 0, 2)
+MainFrameDivider.Position = UDim2.new(0, 20, 0, 70)
+MainFrameDivider.BackgroundColor3 = Color3.fromRGB(0, 255, 255)
+MainFrameDivider.BackgroundTransparency = 0.4
+MainFrameDivider.BorderSizePixel = 0
+MainFrameDivider.Parent = MainFrame
+
+-- Auto Grab Button
+local AutoGrabButton = Instance.new("TextButton")
+AutoGrabButton.Size = UDim2.new(0.9, 0, 0, 50)
+AutoGrabButton.Position = UDim2.new(0.05, 0, 0, 80)
+AutoGrabButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+AutoGrabButton.BackgroundTransparency = 0.2
+AutoGrabButton.BorderSizePixel = 0
+AutoGrabButton.Text = "Auto Grab"
+AutoGrabButton.TextColor3 = Color3.fromRGB(0, 255, 255)
+AutoGrabButton.TextSize = 22
+AutoGrabButton.Font = Enum.Font.SourceSansBold
+AutoGrabButton.Parent = MainFrame
+
+local AutoGrabCorner = Instance.new("UICorner")
+AutoGrabCorner.CornerRadius = UDim.new(0, 12)
+AutoGrabCorner.Parent = AutoGrabButton
+
+local AutoGrabStroke = Instance.new("UIStroke")
+AutoGrabStroke.Color = Color3.fromRGB(0, 200, 255)
+AutoGrabStroke.Thickness = 2
+AutoGrabStroke.Transparency = 0.1
+AutoGrabStroke.Parent = AutoGrabButton
+
+-- Feature Buttons
+local FeaturesContainer = Instance.new("Frame")
+FeaturesContainer.Size = UDim2.new(0.9, 0, 0, 50)
+FeaturesContainer.Position = UDim2.new(0.05, 0, 0, 140)
+FeaturesContainer.BackgroundTransparency = 1
+FeaturesContainer.Parent = MainFrame
+
+local SpeedButton = Instance.new("TextButton")
+SpeedButton.Parent = FeaturesContainer
+SpeedButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+SpeedButton.BackgroundTransparency = 0.2
+SpeedButton.BorderSizePixel = 0
+SpeedButton.Position = UDim2.new(0, 0, 0, 0)
+SpeedButton.Size = UDim2.new(0.48, 0, 1, 0)
+SpeedButton.Font = Enum.Font.SourceSansBold
+SpeedButton.Text = "SPEED"
+SpeedButton.TextColor3 = Color3.fromRGB(0, 255, 255)
+SpeedButton.TextSize = 18
+
+local SpeedCorner = Instance.new("UICorner")
+SpeedCorner.CornerRadius = UDim.new(0, 10)
+SpeedCorner.Parent = SpeedButton
+
+local SpeedStroke = Instance.new("UIStroke")
+SpeedStroke.Color = Color3.fromRGB(0, 200, 255)
+SpeedStroke.Thickness = 2
+SpeedStroke.Transparency = 0.1
+SpeedStroke.Parent = SpeedButton
+
+local LagToggleButton = Instance.new("TextButton")
+LagToggleButton.Parent = FeaturesContainer
+LagToggleButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+LagToggleButton.BackgroundTransparency = 0.2
+LagToggleButton.BorderSizePixel = 0
+LagToggleButton.Position = UDim2.new(0.52, 0, 0, 0)
+LagToggleButton.Size = UDim2.new(0.48, 0, 1, 0)
+LagToggleButton.Font = Enum.Font.SourceSansBold
+LagToggleButton.Text = "LAG"
+LagToggleButton.TextColor3 = Color3.fromRGB(0, 255, 255)
+LagToggleButton.TextSize = 18
+
+local LagToggleCorner = Instance.new("UICorner")
+LagToggleCorner.CornerRadius = UDim.new(0, 10)
+LagToggleCorner.Parent = LagToggleButton
+
+local LagToggleStroke = Instance.new("UIStroke")
+LagToggleStroke.Color = Color3.fromRGB(0, 200, 255)
+LagToggleStroke.Thickness = 2
+LagToggleStroke.Transparency = 0.1
+LagToggleStroke.Parent = LagToggleButton
+
+-- Sliders Section
+local SlidersContainer = Instance.new("Frame")
+SlidersContainer.Size = UDim2.new(0.9, 0, 0, 180) -- Increased for radius slider
+SlidersContainer.Position = UDim2.new(0.05, 0, 0, 200)
+SlidersContainer.BackgroundTransparency = 1
+SlidersContainer.Parent = MainFrame
+
+-- Speed Slider
+local SpeedLabel = Instance.new("TextLabel")
+SpeedLabel.Parent = SlidersContainer
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.Position = UDim2.new(0, 0, 0, 0)
+SpeedLabel.Size = UDim2.new(1, 0, 0, 20)
+SpeedLabel.Font = Enum.Font.SourceSans
+SpeedLabel.Text = "Speed: 16"
+SpeedLabel.TextColor3 = Color3.fromRGB(150, 255, 255)
+SpeedLabel.TextSize = 14
+SpeedLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local SpeedSliderBG = Instance.new("Frame")
+SpeedSliderBG.Parent = SlidersContainer
+SpeedSliderBG.BackgroundColor3 = Color3.fromRGB(10, 15, 25)
+SpeedSliderBG.BorderSizePixel = 0
+SpeedSliderBG.Position = UDim2.new(0, 0, 0, 25)
+SpeedSliderBG.Size = UDim2.new(1, 0, 0, 8)
+
+local SpeedSliderCorner = Instance.new("UICorner")
+SpeedSliderCorner.CornerRadius = UDim.new(1, 0)
+SpeedSliderCorner.Parent = SpeedSliderBG
+
+local SpeedSliderFill = Instance.new("Frame")
+SpeedSliderFill.Parent = SpeedSliderBG
+SpeedSliderFill.BackgroundColor3 = Color3.fromRGB(0, 255, 255)
+SpeedSliderFill.BorderSizePixel = 0
+SpeedSliderFill.Size = UDim2.new(16/700, 0, 1, 0)
+
+local SpeedFillCorner = Instance.new("UICorner")
+SpeedFillCorner.CornerRadius = UDim.new(1, 0)
+SpeedFillCorner.Parent = SpeedSliderFill
+
+-- Lag Slider
+local LagLabel = Instance.new("TextLabel")
+LagLabel.Parent = SlidersContainer
+LagLabel.BackgroundTransparency = 1
+LagLabel.Position = UDim2.new(0, 0, 0, 60)
+LagLabel.Size = UDim2.new(1, 0, 0, 20)
+LagLabel.Font = Enum.Font.SourceSans
+LagLabel.Text = "Lag: 5"
+LagLabel.TextColor3 = Color3.fromRGB(150, 255, 255)
+LagLabel.TextSize = 14
+LagLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local LagSliderBG = Instance.new("Frame")
+LagSliderBG.Parent = SlidersContainer
+LagSliderBG.BackgroundColor3 = Color3.fromRGB(10, 15, 25)
+LagSliderBG.BorderSizePixel = 0
+LagSliderBG.Position = UDim2.new(0, 0, 0, 85)
+LagSliderBG.Size = UDim2.new(1, 0, 0, 8)
+
+local LagSliderCorner = Instance.new("UICorner")
+LagSliderCorner.CornerRadius = UDim.new(1, 0)
+LagSliderCorner.Parent = LagSliderBG
+
+local LagSliderFill = Instance.new("Frame")
+LagSliderFill.Parent = LagSliderBG
+LagSliderFill.BackgroundColor3 = Color3.fromRGB(0, 255, 255)
+LagSliderFill.BorderSizePixel = 0
+LagSliderFill.Size = UDim2.new(5/50, 0, 1, 0)
+
+local LagFillCorner = Instance.new("UICorner")
+LagFillCorner.CornerRadius = UDim.new(1, 0)
+LagFillCorner.Parent = LagSliderFill
+
+-- Radius Slider
+local RadiusLabel = Instance.new("TextLabel")
+RadiusLabel.Parent = SlidersContainer
+RadiusLabel.BackgroundTransparency = 1
+RadiusLabel.Position = UDim2.new(0, 0, 0, 120)
+RadiusLabel.Size = UDim2.new(1, 0, 0, 20)
+RadiusLabel.Font = Enum.Font.SourceSans
+RadiusLabel.Text = "Radius: 20"
+RadiusLabel.TextColor3 = Color3.fromRGB(150, 255, 255)
+RadiusLabel.TextSize = 14
+RadiusLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local RadiusSliderBG = Instance.new("Frame")
+RadiusSliderBG.Parent = SlidersContainer
+RadiusSliderBG.BackgroundColor3 = Color3.fromRGB(10, 15, 25)
+RadiusSliderBG.BorderSizePixel = 0
+RadiusSliderBG.Position = UDim2.new(0, 0, 0, 145)
+RadiusSliderBG.Size = UDim2.new(1, 0, 0, 8)
+
+local RadiusSliderCorner = Instance.new("UICorner")
+RadiusSliderCorner.CornerRadius = UDim.new(1, 0)
+RadiusSliderCorner.Parent = RadiusSliderBG
+
+local RadiusSliderFill = Instance.new("Frame")
+RadiusSliderFill.Parent = RadiusSliderBG
+RadiusSliderFill.BackgroundColor3 = Color3.fromRGB(0, 255, 255)
+RadiusSliderFill.BorderSizePixel = 0
+RadiusSliderFill.Size = UDim2.new((20-5)/195, 0, 1, 0)
+
+local RadiusFillCorner = Instance.new("UICorner")
+RadiusFillCorner.CornerRadius = UDim.new(1, 0)
+RadiusFillCorner.Parent = RadiusSliderFill
+
+-- Progress Bar
+local ProgressContainer = Instance.new("Frame")
+ProgressContainer.Size = UDim2.new(0.9, 0, 0, 30)
+ProgressContainer.Position = UDim2.new(0.05, 0, 0, 390)
+ProgressContainer.BackgroundTransparency = 1
+ProgressContainer.Parent = MainFrame
+
+local ProgressLabel = Instance.new("TextLabel")
+ProgressLabel.Parent = ProgressContainer
+ProgressLabel.BackgroundTransparency = 1
+ProgressLabel.Position = UDim2.new(0, 0, 0, 0)
+ProgressLabel.Size = UDim2.new(1, 0, 0, 20)
+ProgressLabel.Font = Enum.Font.SourceSans
+ProgressLabel.Text = "Steal Progress:"
+ProgressLabel.TextColor3 = Color3.fromRGB(150, 255, 255)
+ProgressLabel.TextSize = 14
+ProgressLabel.TextXAlignment = Enum.TextXAlignment.Left
+
+local progressBarBg = Instance.new("Frame")
+progressBarBg.Size = UDim2.new(1, 0, 0, 8)
+progressBarBg.Position = UDim2.new(0, 0, 0, 22)
+progressBarBg.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+progressBarBg.BorderSizePixel = 0
+progressBarBg.Parent = ProgressContainer
+
+local progressBarCorner = Instance.new("UICorner")
+progressBarCorner.CornerRadius = UDim.new(1, 0)
+progressBarCorner.Parent = progressBarBg
+
+local progressBarFill = Instance.new("Frame")
+progressBarFill.Size = UDim2.new(0, 0, 1, 0)
+progressBarFill.Position = UDim2.new(0, 0, 0, 0)
+progressBarFill.BackgroundColor3 = Color3.fromRGB(0, 128, 255)
+progressBarFill.BorderSizePixel = 0
+progressBarFill.Parent = progressBarBg
+
+local fillCorner = Instance.new("UICorner")
+fillCorner.CornerRadius = UDim.new(1, 0)
+fillCorner.Parent = progressBarFill
+
+local fillGradient = Instance.new("UIGradient")
+fillGradient.Color = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(0, 128, 255)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(0, 200, 255)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(0, 128, 255))
+})
+fillGradient.Parent = progressBarFill
+
+-- Status
+local StatusLabel = Instance.new("TextLabel")
+StatusLabel.Parent = MainFrame
+StatusLabel.BackgroundTransparency = 1
+StatusLabel.Position = UDim2.new(0, 0, 0, 425)
+StatusLabel.Size = UDim2.new(1, 0, 0, 25)
+StatusLabel.Font = Enum.Font.SourceSans
+StatusLabel.Text = "Ready"
+StatusLabel.TextColor3 = Color3.fromRGB(100, 150, 200)
+StatusLabel.TextSize = 12
+
+-- Auto Grab Toggle
+local autoGrabEnabled = false
+AutoGrabButton.MouseButton1Click:Connect(function()
+	autoGrabEnabled = not autoGrabEnabled
+	CONFIG.AUTO_STEAL_NEAREST = autoGrabEnabled
+	
+	if autoGrabEnabled then
+		AutoGrabButton.BackgroundColor3 = Color3.fromRGB(0, 100, 150)
+		AutoGrabButton.Text = "Auto Grab: ON"
+		AutoGrabStroke.Color = Color3.fromRGB(0, 255, 255)
+	else
+		AutoGrabButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+		AutoGrabButton.Text = "Auto Grab"
+		AutoGrabStroke.Color = Color3.fromRGB(0, 200, 255)
+	end
+	updateStatus()
+end)
+
+-- Functions
+local function updateStatus()
+	local active = {}
+	if autoGrabEnabled then table.insert(active, "Auto Grab") end
+	if SpeedEnabled then table.insert(active, "Speed") end
+	if LagEnabled then table.insert(active, "Lag") end
+	if #active > 0 then
+		StatusLabel.Text = table.concat(active, " + ") .. " Active"
+		StatusLabel.TextColor3 = Color3.fromRGB(0, 255, 150)
+	else
+		StatusLabel.Text = "Ready"
+		StatusLabel.TextColor3 = Color3.fromRGB(100, 150, 200)
+	end
+end
+
+-- Speed Button - FROM ZVIOS LAGGER
+SpeedButton.MouseButton1Click:Connect(function()
+	SpeedEnabled = not SpeedEnabled
+	
+	local char = LocalPlayer.Character
+	if char and char:FindFirstChild("Humanoid") then
+		if SpeedEnabled then
+			SpeedButton.BackgroundColor3 = Color3.fromRGB(0, 100, 150)
+			SpeedButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+			SpeedStroke.Color = Color3.fromRGB(0, 255, 255)
+			NormalSpeed = char.Humanoid.WalkSpeed
+			char.Humanoid.WalkSpeed = SpeedValue
+		else
+			SpeedButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+			SpeedButton.TextColor3 = Color3.fromRGB(0, 255, 255)
+			SpeedStroke.Color = Color3.fromRGB(0, 200, 255)
+			char.Humanoid.WalkSpeed = NormalSpeed
+		end
+	end
+	
+	updateStatus()
+end)
+
+-- Lag Toggle Button - FROM ZVIOS LAGGER
+LagToggleButton.MouseButton1Click:Connect(function()
+	LagEnabled = not LagEnabled
+	
+	if LagEnabled then
+		LagToggleButton.BackgroundColor3 = Color3.fromRGB(0, 100, 150)
+		LagToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+		LagToggleStroke.Color = Color3.fromRGB(0, 255, 255)
+	else
+		LagToggleButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+		LagToggleButton.TextColor3 = Color3.fromRGB(0, 255, 255)
+		LagToggleStroke.Color = Color3.fromRGB(0, 200, 255)
+	end
+	
+	updateStatus()
+end)
+
+-- Speed Slider - FROM ZVIOS LAGGER
+local draggingSpeed = false
+
+local function updateSpeedSlider(input)
+	local relPos = math.clamp((input.Position.X - SpeedSliderBG.AbsolutePosition.X) / SpeedSliderBG.AbsoluteSize.X, 0, 1)
+	SpeedSliderFill.Size = UDim2.new(relPos, 0, 1, 0)
+	
+	SpeedValue = math.floor(relPos * 700)
+	if SpeedValue < 1 then SpeedValue = 1 end
+	
+	SpeedLabel.Text = "Speed: " .. SpeedValue
+	
+	if SpeedEnabled and LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Humanoid") then
+		LocalPlayer.Character.Humanoid.WalkSpeed = SpeedValue
+	end
+end
+
+SpeedSliderBG.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingSpeed = true
+		updateSpeedSlider(input)
+		
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				draggingSpeed = false
+			end
+		end)
+	end
+end)
+
+SpeedSliderBG.InputChanged:Connect(function(input)
+	if draggingSpeed and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		updateSpeedSlider(input)
+	end
+end)
+
+-- Lag Slider - FROM ZVIOS LAGGER
+local draggingLag = false
+
+local function updateLagSlider(input)
+	local relPos = math.clamp((input.Position.X - LagSliderBG.AbsolutePosition.X) / LagSliderBG.AbsoluteSize.X, 0, 1)
+	LagSliderFill.Size = UDim2.new(relPos, 0, 1, 0)
+	
+	LagIntensity = math.floor(relPos * 50)
+	if LagIntensity < 1 then LagIntensity = 1 end
+	
+	LagLabel.Text = "Lag: " .. LagIntensity
+end
+
+LagSliderBG.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingLag = true
+		updateLagSlider(input)
+		
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				draggingLag = false
+			end
+		end)
+	end
+end)
+
+LagSliderBG.InputChanged:Connect(function(input)
+	if draggingLag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		updateLagSlider(input)
+	end
+end)
+
+-- Radius Slider
+local draggingRadius = false
+local function updateRadiusSlider(input)
+	local relPos = math.clamp((input.Position.X - RadiusSliderBG.AbsolutePosition.X) / RadiusSliderBG.AbsoluteSize.X, 0, 1)
+	RadiusSliderFill.Size = UDim2.new(relPos, 0, 1, 0)
+	AUTO_STEAL_PROX_RADIUS = math.floor(relPos * 195) + 5
+	RadiusLabel.Text = "Radius: " .. AUTO_STEAL_PROX_RADIUS
+	updateCircleRadius()
+end
+
+RadiusSliderBG.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		draggingRadius = true
+		updateRadiusSlider(input)
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				draggingRadius = false
+			end
+		end)
+	end
+end)
+
+RadiusSliderBG.InputChanged:Connect(function(input)
+	if draggingRadius and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+		updateRadiusSlider(input)
+	end
+end)
+
+animateGradient(MainFrameGradient)
+
+-- Make Main Frame Draggable - FROM ZVIOS LAGGER
+local function makeDraggable(frame)
+	local dragging = false
+	local dragInput, dragStart, startPos
+	
+	local function update(input)
+		if dragging then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(
+				startPos.X.Scale,
+				startPos.X.Offset + delta.X,
+				startPos.Y.Scale,
+				startPos.Y.Offset + delta.Y
+			)
+		end
+	end
+	
+	frame.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or 
+		   input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+			
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	
+	frame.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or 
+		   input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+	
+	UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput then
+			update(input)
+		end
+	end)
+end
+makeDraggable(MainFrame)
+
+-- Toggle Key (E) for Lag - FROM ZVIOS LAGGER
+UserInputService.InputBegan:Connect(function(input, processed)
+	if not processed and input.KeyCode == Enum.KeyCode.E then
+		LagEnabled = not LagEnabled
+		print("Lagger toggled:", LagEnabled)
+		
+		if LagEnabled then
+			LagToggleButton.BackgroundColor3 = Color3.fromRGB(0, 100, 150)
+			LagToggleButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+			LagToggleStroke.Color = Color3.fromRGB(0, 255, 255)
+		else
+			LagToggleButton.BackgroundColor3 = Color3.fromRGB(20, 30, 40)
+			LagToggleButton.TextColor3 = Color3.fromRGB(0, 255, 255)
+			LagToggleStroke.Color = Color3.fromRGB(0, 200, 255)
+		end
+		
+		updateStatus()
+	end
+end)
+
+-- COMPLETELY ISOLATED LAG THREAD - FROM ZVIOS LAGGER
+task.spawn(function()
+	print("Lag thread started!")
+	while true do
+		task.wait(1)
+		
+		if LagEnabled and targetRemote then
+			print("Firing lag burst with intensity:", LagIntensity)
+			task.spawn(function()
+				pcall(function()
+					for i = 1, LagIntensity do
+						targetRemote:FireServer(uuid, payload)
+						task.wait(0.05)
+					end
+				end)
+			end)
+		end
+	end
+end)
+
+-- Speed Loop - FROM ZVIOS LAGGER
+RunService.Heartbeat:Connect(function()
+	if SpeedEnabled then
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChild("Humanoid")
+		if hum and hum.WalkSpeed ~= SpeedValue then
+			hum.WalkSpeed = SpeedValue
+		end
+	end
+end)
+
+local function createCircle(character)
+	for _, part in ipairs(circleParts) do
+		if part then part:Destroy() end
+	end
+	circleParts = {}
+	
+	CIRCLE_RADIUS = AUTO_STEAL_PROX_RADIUS
+	local root = character:WaitForChild("HumanoidRootPart")
+	
+	local points = {}
+	for i = 0, PartsCount - 1 do
+		local angle = math.rad(i * 360 / PartsCount)
+		table.insert(points, Vector3.new(math.cos(angle), 0, math.sin(angle)) * CIRCLE_RADIUS)
+	end
+	
+	for i = 1, #points do
+		local nextIndex = i % #points + 1
+		local p1 = points[i]
+		local p2 = points[nextIndex]
+		
+		local part = Instance.new("Part")
+		part.Anchored = true
+		part.CanCollide = false
+		part.Size = Vector3.new((p2 - p1).Magnitude, PART_HEIGHT, PART_THICKNESS)
+		part.Color = PART_COLOR
+		part.Material = Enum.Material.Neon
+		part.Transparency = 0.3
+		part.TopSurface = Enum.SurfaceType.Smooth
+		part.BottomSurface = Enum.SurfaceType.Smooth
+		part.Parent = workspace
+		table.insert(circleParts, part)
+	end
+end
+
+local function updateCircle(character)
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not root then return end
+	
+	local points = {}
+	for i = 0, PartsCount - 1 do
+		local angle = math.rad(i * 360 / PartsCount)
+		table.insert(points, Vector3.new(math.cos(angle), 0, math.sin(angle)) * CIRCLE_RADIUS)
+	end
+	
+	for i, part in ipairs(circleParts) do
+		local nextIndex = i % #points + 1
+		local p1 = points[i]
+		local p2 = points[nextIndex]
+		local center = (p1 + p2) / 2 + root.Position
+		
+		part.CFrame = CFrame.new(center, center + Vector3.new(p2.X - p1.X, 0, p2.Z - p1.Z)) * CFrame.Angles(0, math.pi/2, 0)
+	end
+end
+
+local function onCharacterAdded(character)
+	if circleEnabled then
+		createCircle(character)
+		RunService:BindToRenderStep("CircleFollow", Enum.RenderPriority.Camera.Value + 1, function()
+			updateCircle(character)
+		end)
+	end
+end
+
+local function updateCircleRadius()
+	CIRCLE_RADIUS = AUTO_STEAL_PROX_RADIUS
+	local character = LocalPlayer.Character
+	if character and circleEnabled then
+		createCircle(character)
+	end
+end
+
+local progressTween = nil
+task.spawn(function()
+	while task.wait(0.03) do
+		if IsStealing then
+			if progressTween then
+				progressTween:Cancel()
+			end
+			
+			progressTween = TweenService:Create(
+				progressBarFill,
+				TweenInfo.new(0.1, Enum.EasingStyle.Linear),
+				{Size = UDim2.new(StealProgress, 0, 1, 0)}
+			)
+			progressTween:Play()
+		else
+			if progressTween then
+				progressTween:Cancel()
+				progressTween = nil
+			end
+			
+			if progressBarFill.Size.X.Scale > 0 then
+				progressBarFill.Size = UDim2.new(
+					math.max(0, progressBarFill.Size.X.Scale - 0.03),
+					0,
+					1,
+					0
+				)
+			end
+		end
+	end
+end)
+
+-- Initialize Silent* Grab System
+initializeScanner()
+autoStealLoop()
+
+if LocalPlayer.Character then
+	onCharacterAdded(LocalPlayer.Character)
+end
+LocalPlayer.CharacterAdded:Connect(onCharacterAdded)
